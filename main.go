@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
+//go:build !js
+// +build !js
+
 package main
 
 import (
@@ -17,32 +23,38 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-// Cloudflare API URL and Token
-const cloudflareAPIUrl = "https://api.cloudflare.com/client/v4/accounts/{account_id}/calls/webrtc/sdp"
-const cloudflareAPIToken = "your_cloudflare_api_token"
+const cloudflareAPI = "https://rtc.live.cloudflare.com/v1"
+
+var (
+	cloudflareApiToken = os.Getenv("CLOUDFLARE_API_TOKEN")
+	turnToken          = os.Getenv("TURN_TOKEN")
+	cloudflareTurnAPI  = cloudflareAPI + "/turn/keys/" + turnToken + "/credentials/generate"
+)
 
 func main() {
+	turnCredentials, err := getTurnCredentials()
+	if err != nil {
+		panic(err)
+	}
+
 	// Create a MediaEngine object to configure the supported codec
 	m := &webrtc.MediaEngine{}
 
 	// Setup the codecs you want to use.
-	// We'll use a VP8 and Opus but you can also define your own
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000, Channels: 0, SDPFmtpLine: "", RTCPFeedback: nil},
+		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000, Channels: 0},
 		PayloadType:        96,
 	}, webrtc.RTPCodecTypeVideo); err != nil {
 		panic(err)
 	}
 
-	// Create a InterceptorRegistry
+	// Create an InterceptorRegistry
 	i := &interceptor.Registry{}
-
-	// Use the default set of Interceptors
 	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
 		panic(err)
 	}
 
-	// Register a intervalpli factory
+	// Register an intervalpli factory
 	intervalPliFactory, err := intervalpli.NewReceiverInterceptor()
 	if err != nil {
 		panic(err)
@@ -52,14 +64,17 @@ func main() {
 	// Create the API object with the MediaEngine
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i))
 
-	// Prepare the configuration
+	// Prepare the configuration with Cloudflare TURN servers
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
+				URLs:       turnCredentials.ICECredentials.URLs,
+				Username:   turnCredentials.ICECredentials.Username,
+				Credential: turnCredentials.ICECredentials.Credential,
 			},
 		},
 	}
+
 	// Create a new RTCPeerConnection
 	peerConnection, err := api.NewPeerConnection(config)
 	if err != nil {
@@ -71,7 +86,7 @@ func main() {
 		}
 	}()
 
-	// Create Track that we send video back to browser on
+	// Create Track that we send video back to the browser on
 	outputTrack, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}, "video", "pion")
 	if err != nil {
 		panic(err)
@@ -97,14 +112,8 @@ func main() {
 	offer := webrtc.SessionDescription{}
 	decode(readUntilNewline(), &offer)
 
-	// Send the offer to Cloudflare Calls and get the answer
-	answer, err := sendOfferToCloudflare(offer)
-	if err != nil {
-		panic(err)
-	}
-
 	// Set the remote SessionDescription
-	err = peerConnection.SetRemoteDescription(answer)
+	err = peerConnection.SetRemoteDescription(offer)
 	if err != nil {
 		panic(err)
 	}
@@ -113,7 +122,6 @@ func main() {
 	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		fmt.Printf("Track has started, of type %d: %s \n", track.PayloadType(), track.Codec().MimeType)
 		for {
-			// Read RTP packets being sent to Pion
 			rtp, _, readErr := track.ReadRTP()
 			if readErr != nil {
 				panic(readErr)
@@ -140,51 +148,28 @@ func main() {
 		}
 	})
 
+	// Create an answer
+	answer, err := peerConnection.CreateAnswer(nil)
+	if err != nil {
+		panic(err)
+	}
+
+	// Create a channel that is blocked until ICE Gathering is complete
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+
+	// Set the LocalDescription and start our UDP listeners
+	if err = peerConnection.SetLocalDescription(answer); err != nil {
+		panic(err)
+	}
+
+	// Block until ICE Gathering is complete
+	<-gatherComplete
+
+	// Output the answer in base64 so we can paste it in the browser
+	fmt.Println(encode(peerConnection.LocalDescription()))
+
 	// Block forever
 	select {}
-}
-
-func sendOfferToCloudflare(offer webrtc.SessionDescription) (webrtc.SessionDescription, error) {
-	requestBody, err := json.Marshal(map[string]interface{}{
-		"sdp":  offer.SDP,
-		"type": offer.Type.String(),
-	})
-	if err != nil {
-		return webrtc.SessionDescription{}, err
-	}
-
-	req, err := http.NewRequest("POST", cloudflareAPIUrl, bytes.NewBuffer(requestBody))
-	if err != nil {
-		return webrtc.SessionDescription{}, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cloudflareAPIToken)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return webrtc.SessionDescription{}, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return webrtc.SessionDescription{}, err
-	}
-
-	var response map[string]interface{}
-	if err := json.Unmarshal(body, &response); err != nil {
-		return webrtc.SessionDescription{}, err
-	}
-
-	sdp := response["sdp"].(string)
-	sdpType := response["type"].(string)
-
-	return webrtc.SessionDescription{
-		SDP:  sdp,
-		Type: webrtc.NewSDPType(sdpType),
-	}, nil
 }
 
 // Read from stdin until we get a newline
@@ -227,4 +212,49 @@ func decode(in string, obj *webrtc.SessionDescription) {
 	if err = json.Unmarshal(b, obj); err != nil {
 		panic(err)
 	}
+}
+
+func getTurnCredentials() (*TurnCredentials, error) {
+	url := cloudflareTurnAPI
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Add("Authorization", "Bearer "+cloudflareApiToken)
+	req.Header.Add("Content-Type", "application/json")
+	req.Body = io.NopCloser(bytes.NewReader([]byte(`{"ttl": 86400}`)))
+
+
+
+	
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	//body, _ := io.ReadAll(resp.Body)
+	//fmt.Printf("Response status: %s\n", resp.Status)
+	//fmt.Printf("Response body: %s\n", string(body))
+
+	if resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("failed to get TURN credentials, status: %s", resp.Status)
+	}
+
+	var credentials TurnCredentials
+	if err := json.NewDecoder(resp.Body).Decode(&credentials); err != nil {
+		return nil, err
+	}
+
+	return &credentials, nil
+}
+
+type TurnCredentials struct {
+	ICECredentials struct {
+		URLs       []string `json:"urls"`
+		Username   string   `json:"username"`
+		Credential string   `json:"credential"`
+	} `json:"iceServers"`
 }
